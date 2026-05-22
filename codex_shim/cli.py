@@ -7,6 +7,7 @@ import subprocess
 import sys
 
 from .catalog import codex_config_overrides, write_catalog, write_config
+from .config import CodexConfig
 from .settings import VIBEPROXY_URL, VIBEPROXY_API_URL, VibeProxySettings, default_model_slug
 
 
@@ -16,8 +17,6 @@ CATALOG_PATH = RUNTIME_DIR / "custom_model_catalog.json"
 CONFIG_PATH = RUNTIME_DIR / "config.toml"
 CODEX_CONFIG_PATH = Path.home() / ".codex" / "config.toml"
 CODEX_CONFIG_BACKUP_PATH = RUNTIME_DIR / "config.toml.before-codex-shim"
-MANAGED_BEGIN = "# >>> codex-shim managed >>>"
-MANAGED_END = "# <<< codex-shim managed <<<"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -57,10 +56,14 @@ def main(argv: list[str] | None = None) -> int:
         return list_models(args.vibeproxy_url)
     if args.command == "enable":
         generate(args.vibeproxy_url, base_url)
-        install_codex_config(args.vibeproxy_url, base_url)
+        models = VibeProxySettings(args.vibeproxy_url).load()
+        default_slug = _resolve_model_slug(models, None)
+        config = CodexConfig(CODEX_CONFIG_PATH, CODEX_CONFIG_BACKUP_PATH)
+        config.install_shim(default_slug, base_url, CATALOG_PATH, provider_name=default_slug)
         return 0
     if args.command == "disable":
-        restore_codex_config()
+        config = CodexConfig(CODEX_CONFIG_PATH, CODEX_CONFIG_BACKUP_PATH)
+        config.remove_shim()
         return 0
     if args.command == "patch-app":
         return patch_codex_app()
@@ -71,7 +74,10 @@ def main(argv: list[str] | None = None) -> int:
             return list_models(args.vibeproxy_url)
         if args.model_command == "use":
             generate(args.vibeproxy_url, base_url)
-            install_codex_config(args.vibeproxy_url, base_url, args.model_slug)
+            models = VibeProxySettings(args.vibeproxy_url).load()
+            default_slug = _resolve_model_slug(models, args.model_slug)
+            config = CodexConfig(CODEX_CONFIG_PATH, CODEX_CONFIG_BACKUP_PATH)
+            config.install_shim(default_slug, base_url, CATALOG_PATH, provider_name=default_slug)
             print(f"Active Codex shim model: {args.model_slug}")
             return 0
     if args.command == "codex":
@@ -80,7 +86,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "app":
         generate(args.vibeproxy_url, base_url)
-        install_codex_config(args.vibeproxy_url, base_url, args.model_slug)
+        models = VibeProxySettings(args.vibeproxy_url).load()
+        default_slug = _resolve_model_slug(models, args.model_slug)
+        config = CodexConfig(CODEX_CONFIG_PATH, CODEX_CONFIG_BACKUP_PATH)
+        config.install_shim(default_slug, base_url, CATALOG_PATH, provider_name=default_slug)
         exec_codex_app(args.path)
         return 0
     return 2
@@ -89,28 +98,12 @@ def main(argv: list[str] | None = None) -> int:
 def generate(vibeproxy_url: str, base_url: str) -> None:
     models = VibeProxySettings(vibeproxy_url).load()
     write_catalog(models, CATALOG_PATH)
-    write_config(models, CONFIG_PATH, CATALOG_PATH, base_url)
+    default_slug = default_model_slug(models)
+    write_config(models, CONFIG_PATH, CATALOG_PATH, base_url, provider_name=default_slug)
     print(f"Generated {len(models)} model entries:")
     print(f"  catalog: {CATALOG_PATH}")
     print(f"  config:  {CONFIG_PATH}")
     print("No files under ~/.codex were modified.")
-
-
-def install_codex_config(vibeproxy_url: str, base_url: str, model_slug: str | None = None) -> None:
-    models = VibeProxySettings(vibeproxy_url).load()
-    default_slug = _resolve_model_slug(models, model_slug)
-    CODEX_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-    original = CODEX_CONFIG_PATH.read_text() if CODEX_CONFIG_PATH.exists() else ""
-    if MANAGED_BEGIN not in original and not CODEX_CONFIG_BACKUP_PATH.exists():
-        CODEX_CONFIG_BACKUP_PATH.write_text(original)
-    cleaned = _remove_managed_config(original)
-    cleaned = _remove_top_level_keys(cleaned, {"model", "model_provider", "model_catalog_json"})
-    cleaned = _remove_section(cleaned, "model_providers.vibeproxy_shim")
-    top_block, provider_block = _managed_config_blocks(default_slug, base_url)
-    CODEX_CONFIG_PATH.write_text(top_block + "\n" + cleaned.lstrip() + "\n" + provider_block)
-    print(f"Installed shim config into {CODEX_CONFIG_PATH}.")
-    print(f"Original backup: {CODEX_CONFIG_BACKUP_PATH}")
 
 
 def list_models(vibeproxy_url: str) -> int:
@@ -119,20 +112,6 @@ def list_models(vibeproxy_url: str) -> int:
     for model in models:
         print(f"{model.slug:<{width}}  {model.display_name}  ->  {model.model} ({model.owned_by})")
     return 0
-
-
-def restore_codex_config() -> None:
-    if CODEX_CONFIG_BACKUP_PATH.exists():
-        CODEX_CONFIG_PATH.write_text(CODEX_CONFIG_BACKUP_PATH.read_text())
-        CODEX_CONFIG_BACKUP_PATH.unlink()
-        print(f"Restored original {CODEX_CONFIG_PATH}.")
-        return
-    if CODEX_CONFIG_PATH.exists():
-        current = CODEX_CONFIG_PATH.read_text()
-        restored = _remove_managed_config(current)
-        restored = _remove_section(restored, "model_providers.vibeproxy_shim")
-        CODEX_CONFIG_PATH.write_text(restored.lstrip())
-        print(f"Removed shim config from {CODEX_CONFIG_PATH}.")
 
 
 def exec_codex(vibeproxy_url: str, base_url: str, codex_args: list[str]) -> None:
@@ -289,73 +268,10 @@ end tell
         pass
 
 
-def _managed_config_blocks(default_slug: str, base_url: str) -> tuple[str, str]:
-    top_block = f'''{MANAGED_BEGIN}
-model = "{default_slug}"
-model_provider = "vibeproxy_shim"
-model_catalog_json = "{CATALOG_PATH}"
-{MANAGED_END}
-'''
-
-    provider_block = f'''{MANAGED_BEGIN}
-[model_providers.vibeproxy_shim]
-name = "VibeProxy"
-base_url = "{base_url}"
-wire_api = "responses"
-experimental_bearer_token = "dummy"
-request_max_retries = 3
-stream_max_retries = 3
-stream_idle_timeout_ms = 600000
-{MANAGED_END}
-'''
-    return top_block, provider_block
-
-
-def _remove_managed_config(text: str) -> str:
-    while MANAGED_BEGIN in text:
-        before, rest = text.split(MANAGED_BEGIN, 1)
-        if MANAGED_END not in rest:
-            return before
-        _, after = rest.split(MANAGED_END, 1)
-        text = before + after
-    return text
-
-
-def _remove_top_level_keys(text: str, keys: set[str]) -> str:
-    lines = text.splitlines()
-    output: list[str] = []
-    in_top_level = True
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith("["):
-            in_top_level = False
-        key = stripped.split("=", 1)[0].strip() if "=" in stripped else ""
-        if in_top_level and key in keys:
-            continue
-        output.append(line)
-    return "\n".join(output) + ("\n" if text.endswith("\n") else "")
-
-
-def _remove_section(text: str, section: str) -> str:
-    lines = text.splitlines()
-    output: list[str] = []
-    skipping = False
-    header = f"[{section}]"
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith("[") and stripped.endswith("]"):
-            skipping = stripped == header
-            if skipping:
-                continue
-        if not skipping:
-            output.append(line)
-    return "\n".join(output) + ("\n" if text.endswith("\n") else "")
-
-
 def _override_args(vibeproxy_url: str, base_url: str) -> list[str]:
     models = VibeProxySettings(vibeproxy_url).load()
     default_slug = default_model_slug(models)
-    pairs = codex_config_overrides(CATALOG_PATH, default_slug, base_url)
+    pairs = codex_config_overrides(CATALOG_PATH, default_slug, base_url, provider_name=default_slug)
     args: list[str] = []
     for pair in pairs:
         args.extend(["-c", pair])
@@ -364,7 +280,8 @@ def _override_args(vibeproxy_url: str, base_url: str) -> list[str]:
 
 def _resolve_model_slug(models, requested: str | None) -> str:
     if requested is None:
-        return _current_managed_model() or default_model_slug(models)
+        current = CodexConfig(CODEX_CONFIG_PATH).read_active_model()
+        return current or default_model_slug(models)
     by_slug = {model.slug: model.slug for model in models}
     by_model = {}
     for model in models:
@@ -379,16 +296,6 @@ def _resolve_model_slug(models, requested: str | None) -> str:
     if matches:
         raise SystemExit(f"Ambiguous model {requested!r}. Matches: {', '.join(matches)}")
     raise SystemExit(f"Unknown shim model {requested!r}. Run: codex-shim model list")
-
-
-def _current_managed_model() -> str | None:
-    if not CODEX_CONFIG_PATH.exists():
-        return None
-    for line in CODEX_CONFIG_PATH.read_text().splitlines():
-        stripped = line.strip()
-        if stripped.startswith("model = "):
-            return stripped.split("=", 1)[1].strip().strip('"')
-    return None
 
 
 def _effective_base_url(vibeproxy_url: str) -> str:

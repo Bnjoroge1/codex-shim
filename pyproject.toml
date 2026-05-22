@@ -3,7 +3,7 @@ name = "codex-vibeproxy-shim"
 version = "0.2.0"
 description = "Opt-in Codex shim that exposes VibeProxy models in the picker."
 requires-python = ">=3.11"
-dependencies = []
+dependencies = ["tomli_w>=1.0"]
 
 [project.optional-dependencies]
 dev = ["aiohttp>=3.9", "pytest>=8", "pytest-asyncio>=0.23"]
