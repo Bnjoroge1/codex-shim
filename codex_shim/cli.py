@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
+import re
 import subprocess
 import struct
 import sys
@@ -31,6 +32,8 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("list")
     sub.add_parser("enable")
     sub.add_parser("disable")
+    sub.add_parser("toggle", help="Toggle persistent VibeProxy routing in ~/.codex/config.toml.")
+    sub.add_parser("status", help="Show whether persistent VibeProxy routing is enabled.")
     sub.add_parser("patch-app", help="Patch Codex Desktop model dropdown to allow custom catalog models.")
     sub.add_parser("restore-app", help="Restore Codex Desktop app.asar from the pre-patch backup.")
 
@@ -64,7 +67,23 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "disable":
         config = CodexConfig(CODEX_CONFIG_PATH, CODEX_CONFIG_BACKUP_PATH)
-        config.remove_shim()
+        config.disable_shim()
+        return 0
+    if args.command == "toggle":
+        config = CodexConfig(CODEX_CONFIG_PATH, CODEX_CONFIG_BACKUP_PATH)
+        if config.is_shim_enabled():
+            config.disable_shim()
+            print("VibeProxy shim: disabled")
+        else:
+            generate(args.vibeproxy_url, base_url)
+            models = VibeProxySettings(args.vibeproxy_url).load()
+            default_slug = _resolve_model_slug(models, None)
+            config.install_shim(default_slug, base_url, CATALOG_PATH, provider_name=default_slug)
+            print("VibeProxy shim: enabled")
+        return 0
+    if args.command == "status":
+        config = CodexConfig(CODEX_CONFIG_PATH, CODEX_CONFIG_BACKUP_PATH)
+        print("enabled" if config.is_shim_enabled() else "disabled")
         return 0
     if args.command == "patch-app":
         return patch_codex_app()
@@ -180,13 +199,15 @@ def patch_codex_app() -> int:
         print("Codex Desktop model picker patch is already applied.")
     elif needle in text:
         bundle_file.write_text(text.replace(needle, replacement))
-        subprocess.run(["npx", "--yes", "asar", "pack", str(workdir), str(app_asar)], check=True)
         changed = True
         print("Patched Codex Desktop model picker allowlist filter.")
     else:
         print("Could not find the expected model picker filter in Codex Desktop.", file=sys.stderr)
         return 1
-    if changed:
+    menu_changed = _patch_codex_shim_menu(workdir)
+    bootstrap_changed = _patch_codex_shim_bootstrap_menu(workdir)
+    if changed or menu_changed or bootstrap_changed:
+        subprocess.run(["npx", "--yes", "asar", "pack", str(workdir), str(app_asar)], check=True)
         _update_asar_integrity(app_asar)
         _resign_codex_app()
     return 0
@@ -234,6 +255,72 @@ def _find_model_queries_bundle(workdir: Path, needle: str, replacement: str) -> 
         if needle in text or replacement in text:
             return path
     return None
+
+
+def _patch_codex_shim_menu(workdir: Path) -> bool:
+    build_dir = workdir / ".vite" / "build"
+    if not build_dir.exists():
+        return False
+    target = "oe=ue.refreshApplicationMenu;let de=()=>{ue.refreshApplicationMenu()};"
+    replacement = f"{_codex_shim_menu_js()};oe=()=>{{ue.refreshApplicationMenu(),__codexShimMenu()}};let de=()=>{{oe()}};"
+    startup_target = "ue.refreshApplicationMenu(),w(`application menu refreshed`,A)"
+    startup_replacement = "oe(),w(`application menu refreshed`,A)"
+    direct_refresh = "=>{ue.refreshApplicationMenu()}"
+    wrapped_refresh = "=>{oe()}"
+    for path in sorted(build_dir.glob("main-*.js")):
+        text = path.read_text()
+        if "codex-shim-menu-enable" in text:
+            if direct_refresh in text:
+                path.write_text(text.replace(direct_refresh, wrapped_refresh))
+                print("Patched Codex Desktop VibeProxy menu refresh hooks.")
+                return True
+            return False
+        if "codex-shim-toggle-enable" in text:
+            pattern = r"let __codexShimMenu=\(\)=>\{try\{.*?\}\};oe=\(\)=>\{ue\.refreshApplicationMenu\(\),__codexShimMenu\(\)\};"
+            text, count = re.subn(pattern, f"{_codex_shim_menu_js()};oe=()=>{{ue.refreshApplicationMenu(),__codexShimMenu()}};", text, count=1)
+            if count:
+                text = text.replace(direct_refresh, wrapped_refresh)
+                path.write_text(text)
+                print("Updated Codex Desktop VibeProxy menu placement.")
+                return True
+            return False
+        if target not in text:
+            continue
+        text = (
+            text.replace(target, replacement, 1)
+            .replace(startup_target, startup_replacement, 1)
+            .replace(direct_refresh, wrapped_refresh)
+        )
+        path.write_text(text)
+        print("Patched Codex Desktop VibeProxy menu.")
+        return True
+    print("Could not find the expected application menu hook in Codex Desktop.", file=sys.stderr)
+    return False
+
+
+def _patch_codex_shim_bootstrap_menu(workdir: Path) -> bool:
+    bootstrap = workdir / ".vite" / "build" / "bootstrap.js"
+    if not bootstrap.exists():
+        return False
+    text = bootstrap.read_text()
+    if "codex-shim-bootstrap-menu-enable" in text:
+        return False
+    target = "let n=require(`electron`),r=require(`node:path`);"
+    if target not in text:
+        print("Could not find the expected bootstrap menu hook in Codex Desktop.", file=sys.stderr)
+        return False
+    hook = target + _codex_shim_bootstrap_menu_js()
+    bootstrap.write_text(text.replace(target, hook, 1))
+    print("Patched Codex Desktop bootstrap VibeProxy menu hook.")
+    return True
+
+
+def _codex_shim_menu_js() -> str:
+    return """let __codexShimMenu=()=>{try{let e=n.Menu.getApplicationMenu();if(!e||e.getMenuItemById(`codex-shim-menu-enable`))return;let t=`${process.env.HOME}/.local/bin/codex-shim`,r=(e,r,i=!0)=>{d.execFile(t,[e],(e,t,a)=>{let o=e?`VibeProxy ${r} failed`:`VibeProxy ${r}`,s=(t||a||e?.message||``).trim(),c=i&&!e?[`Restart Codex`,`Later`]:[`OK`];n.dialog.showMessageBox({type:e?`error`:`info`,buttons:c,defaultId:0,cancelId:c.length-1,message:o,detail:`${s}${s?`\\n\\n`:``}Restart Codex Desktop for model picker changes to apply.`}).then(t=>{i&&!e&&t.response===0&&(n.app.relaunch(),n.app.exit(0))})})};let i=n.Menu.buildFromTemplate([{type:`separator`},{id:`codex-shim-menu-enable`,label:`Enable VibeProxy`,click:()=>r(`enable`,`enabled`)},{id:`codex-shim-menu-disable`,label:`Disable VibeProxy`,click:()=>r(`disable`,`disabled`)},{id:`codex-shim-menu-status`,label:`Show VibeProxy Status`,click:()=>r(`status`,`status`,!1)}]),a=e.items[0]?.submenu;if(!a)return;for(let e of i.items)a.append(e);n.Menu.setApplicationMenu(e)}catch(e){}}"""
+
+
+def _codex_shim_bootstrap_menu_js() -> str:
+    return """(()=>{try{let e=n.Menu.setApplicationMenu.bind(n.Menu),t=(e,t,a=!0)=>{i.execFile(`${process.env.HOME}/.local/bin/codex-shim`,[e],(e,i,o)=>{let s=e?`VibeProxy ${t} failed`:`VibeProxy ${t}`,c=(i||o||e?.message||``).trim(),l=a&&!e?[`Restart Codex`,`Later`]:[`OK`];n.dialog.showMessageBox({type:e?`error`:`info`,buttons:l,defaultId:0,cancelId:l.length-1,message:s,detail:`${c}${c?`\\n\\n`:``}Restart Codex Desktop for model picker changes to apply.`}).then(t=>{a&&!e&&t.response===0&&(n.app.relaunch(),n.app.exit(0))})})},r=e=>{try{if(!e||e.getMenuItemById(`codex-shim-bootstrap-menu-enable`))return e;let r=e.items[0]?.submenu;if(!r)return e;let a=n.Menu.buildFromTemplate([{type:`separator`},{id:`codex-shim-bootstrap-menu-enable`,label:`Enable VibeProxy`,click:()=>t(`enable`,`enabled`)},{id:`codex-shim-bootstrap-menu-disable`,label:`Disable VibeProxy`,click:()=>t(`disable`,`disabled`)},{id:`codex-shim-bootstrap-menu-status`,label:`Show VibeProxy Status`,click:()=>t(`status`,`status`,!1)}]);for(let e of a.items)r.append(e)}catch(e){}return e};n.Menu.setApplicationMenu=t=>e(r(t))}catch(e){}})();"""
 
 
 def _resign_codex_app() -> None:

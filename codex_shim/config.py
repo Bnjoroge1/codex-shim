@@ -16,6 +16,7 @@ except ImportError as exc:  # pragma: no cover
 
 _SHIM_TOP_LEVEL_KEYS = {"model", "model_provider", "model_catalog_json"}
 _SHIM_PROVIDER_TABLE = "vibeproxy_shim"
+_DEFAULT_NATIVE_MODEL = "gpt-5.5"
 
 
 class CodexConfig:
@@ -36,6 +37,18 @@ class CodexConfig:
             return None
         value = data.get("model")
         return str(value).strip('"') if value is not None else None
+
+    def is_shim_enabled(self) -> bool:
+        """Return True when the active top-level config routes through the shim."""
+        data = self._load()
+        if data is None:
+            return False
+        providers = data.get("model_providers")
+        return (
+            data.get("model_provider") == _SHIM_PROVIDER_TABLE
+            or data.get("model_catalog_json") is not None
+            or isinstance(providers, dict) and _SHIM_PROVIDER_TABLE in providers
+        )
 
     def install_shim(
         self,
@@ -91,6 +104,21 @@ class CodexConfig:
         data = self._remove_shim_data(data)
         self._save(data)
         print(f"Removed shim config from {self.path}.")
+
+    def disable_shim(self, fallback_model: str = _DEFAULT_NATIVE_MODEL) -> None:
+        """Disable shim routing without restoring an old full-file backup."""
+        data = self._load()
+        if data is None:
+            print(
+                f"Warning: skipping shim disable because {self.path} is not valid TOML.",
+                file=sys.stderr,
+            )
+            return
+
+        data = self._remove_shim_data(data)
+        data["model"] = fallback_model
+        self._save(data)
+        print(f"Disabled shim config in {self.path}.")
 
     # --------------------------------------------------------------------- #
     # Helpers

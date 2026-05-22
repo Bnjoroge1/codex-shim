@@ -96,6 +96,15 @@ class TestInstallShim:
         captured = capsys.readouterr()
         assert "not valid TOML" in captured.err
 
+    def test_detects_enabled_shim(self, config_pair):
+        config_path, backup_path = config_pair
+        cc = CodexConfig(config_path, backup_path)
+        assert cc.is_shim_enabled() is False
+
+        cc.install_shim("gpt-5.5", "http://localhost:8317/v1", config_path.parent / "catalog.json")
+
+        assert cc.is_shim_enabled() is True
+
 
 class TestRemoveShim:
     def test_restores_backup(self, config_pair):
@@ -136,3 +145,16 @@ class TestRemoveShim:
         assert 'theme = "dark"' in text
         assert "vibeproxy_shim" not in text
         assert 'model = "gpt-5.5"' not in text
+
+    def test_disable_shim_preserves_other_settings(self, config_pair):
+        config_path, backup_path = config_pair
+        config_path.write_text('theme = "dark"\nmodel = "gpt-5.3-codex"\nmodel_provider = "vibeproxy_shim"\nmodel_catalog_json = "/tmp/catalog.json"\n[model_providers.vibeproxy_shim]\nname = "VibeProxy"\n')
+        cc = CodexConfig(config_path, backup_path)
+
+        cc.disable_shim()
+
+        text = config_path.read_text()
+        assert 'theme = "dark"' in text
+        assert 'model = "gpt-5.5"' in text
+        assert "vibeproxy_shim" not in text
+        assert "model_catalog_json" not in text
