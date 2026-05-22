@@ -1,13 +1,12 @@
 # codex-shim
 
-Run **Codex Desktop** with any model declared in your `~/.factory/settings.json`
-(or any custom JSON file), plus an optional passthrough to your **ChatGPT
-subscription's GPT‑5.5** — without recompiling Codex.
+Run **Codex Desktop** with any model exposed by your local **VibeProxy**
+instance, without recompiling Codex.
 
-The shim is a small local Python server that pretends to be an OpenAI Responses
-API endpoint. Codex points at it; the shim routes each request to whatever
-upstream the matching Factory BYOK entry uses (OpenAI / Anthropic /
-generic-chat-completion-api / ChatGPT subscription).
+VibeProxy already speaks the OpenAI Responses API on `http://127.0.0.1:8317`.
+This shim simply generates a Codex-compatible model catalog from VibeProxy's
+`/v1/models` endpoint (on `http://127.0.0.1:8318`) and points Codex at it
+directly. No middleman server.
 
 > Status: tested on Codex Desktop **0.133.0-alpha.1** for macOS arm64.
 > Linux/Windows users should be able to skip the ASAR patch section and use the
@@ -18,10 +17,9 @@ generic-chat-completion-api / ChatGPT subscription).
 ## Why
 
 Codex Desktop only shows the models its server-side Statsig config whitelists.
-If you have OpenAI / Anthropic / Z.ai / DeepSeek / Gemini / OpenRouter / Factory
-keys you'd like to use **as first-class models in the picker**, this gets you
-there. It also lets you keep your ChatGPT subscription's GPT‑5.5 visible
-alongside everything else.
+If you have VibeProxy routing to OpenAI / Anthropic / Moonshot / Z.ai /
+DeepSeek / Gemini / OpenRouter / etc., this shim surfaces all of those models
+as first-class picker entries.
 
 ---
 
@@ -30,28 +28,31 @@ alongside everything else.
 ```bash
 git clone https://github.com/<you>/codex-shim ~/Documents/codex-shim
 cd ~/Documents/codex-shim
-python3 -m pip install --user aiohttp pytest    # only runtime dep is aiohttp
-ln -s "$PWD/bin/codex-shim" ~/.local/bin/codex-shim
-ln -s "$PWD/bin/codex-app"  ~/.local/bin/codex-app
-ln -s "$PWD/bin/codex-model" ~/.local/bin/codex-model
+python3 -m pip install --user -e .
 ```
 
-Requires Python 3.11+.
+Requires Python 3.11+ and `aiohttp`.
 
 ---
 
 ## Quick start
 
-### 1. Generate the catalog and start the shim
+### 1. Make sure VibeProxy is running
+
+The shim expects:
+- Model list at `http://127.0.0.1:8318/v1/models`
+- API at `http://127.0.0.1:8317/v1`
+
+(Use `--vibeproxy-url` and `--vibeproxy-api-url` if yours is elsewhere.)
+
+### 2. Generate the catalog
 
 ```bash
-codex-shim generate          # reads ~/.factory/settings.json, writes catalog
-codex-shim start             # background daemon on 127.0.0.1:8765
+codex-shim generate          # reads VibeProxy /v1/models, writes catalog
 codex-shim list              # show generated slugs and upstream routes
-codex-shim status            # health probe
 ```
 
-### 2. Point Codex Desktop at it (no global config changes)
+### 3. Point Codex Desktop at it (no global config changes)
 
 ```bash
 codex-shim app .             # launch Codex with the shim wired in
@@ -59,74 +60,27 @@ codex-shim app .             # launch Codex with the shim wired in
 
 That command applies opt-in `-c` overrides only for this launch. Your
 `~/.codex/config.toml` is left untouched. After this Codex Desktop sees every
-entry from `~/.factory/settings.json` plus an optional `OpenAI GPT-5.5
-(ChatGPT)` slug as picker entries.
+model VibeProxy exposes as picker entries.
 
 If your Codex Desktop's model picker only shows "default" and refuses to render
 the catalog entries, you also need the **picker patch** below.
 
-### 3. (Optional) Switch the active Desktop model
+### 4. (Optional) Switch the active Desktop model
 
 ```bash
-codex-model list
-codex-model openai-gpt-5-5    # or any other slug from `list`
-codex-app                     # relaunch Codex with new default
+codex-shim model list
+codex-shim model use gpt-5.5      # or kimi-k2.6, etc.
+codex-shim app .                   # relaunch Codex with new default
 ```
 
 ---
 
-## Custom config file
-
-The shim defaults to `~/.factory/settings.json` (the file Factory.ai writes
-when you save BYOK custom models). You can point it at any file:
+## Custom VibeProxy URL
 
 ```bash
-codex-shim --settings /path/to/my-models.json generate
-codex-shim --settings /path/to/my-models.json start
+codex-shim --vibeproxy-url http://localhost:8318 --vibeproxy-api-url http://localhost:8317 generate
+codex-shim --vibeproxy-url http://localhost:8318 --vibeproxy-api-url http://localhost:8317 app
 ```
-
-Schema expected (Factory's own format):
-
-```json
-{
-  "customModels": [
-    {
-      "model": "gpt-5.5",
-      "provider": "openai",
-      "baseUrl": "https://api.openai.com/v1",
-      "apiKey": "sk-…",
-      "displayName": "OpenAI GPT-5.5",
-      "maxContextLimit": 400000
-    },
-    {
-      "model": "claude-opus-4-7-20251109",
-      "provider": "anthropic",
-      "baseUrl": "https://api.anthropic.com/v1",
-      "apiKey": "sk-ant-…",
-      "displayName": "Claude Opus 4.7"
-    },
-    {
-      "model": "deepseek-v4-pro",
-      "provider": "anthropic",
-      "baseUrl": "https://api.deepseek.com/anthropic",
-      "apiKey": "…",
-      "displayName": "DeepSeek V4 Pro",
-      "noImageSupport": true
-    }
-  ]
-}
-```
-
-The shim **never copies your API keys** into the generated catalog. Keys stay
-in your settings file and are read fresh on every request.
-
-Supported `provider` values:
-
-| provider | upstream API |
-|---|---|
-| `openai` | OpenAI/`/v1/chat/completions` |
-| `generic-chat-completion-api` | OpenAI-shaped chat completions |
-| `anthropic` | Anthropic `/v1/messages` |
 
 ---
 
@@ -192,44 +146,20 @@ To roll back: `sudo rm -rf "$APP" && sudo mv "$APP.unpatched-…" "$APP"`.
 
 ---
 
-## ChatGPT GPT‑5.5 passthrough (optional)
-
-If you have a ChatGPT plan with Codex access (`~/.codex/auth.json` exists with
-`auth_mode: chatgpt`), the shim exposes one synthetic slug
-`openai-gpt-5-5` (display name `OpenAI GPT-5.5 (ChatGPT)`) that proxies
-straight to `https://chatgpt.com/backend-api/codex/responses` with your access
-token. It bypasses Factory entirely and uses your ChatGPT subscription quota.
-
-It's already in `.codex-shim/custom_model_catalog.json` after `codex-shim
-generate`. Just select it in the picker.
-
-If you don't want it, delete the entry with slug `openai-gpt-5-5` from the
-generated catalog, or run with `CODEX_SHIM_DISABLE_CHATGPT=1` (TODO).
-
----
-
-## How the routing works
+## How it works
 
 ```
-Codex Desktop ── /v1/responses ──▶ codex-shim (127.0.0.1:8765)
-                                     │
-                                     ├── slug "openai-gpt-5-5"
-                                     │       └─▶ chatgpt.com/backend-api/codex/responses
-                                     │           (Authorization: Bearer <auth.json access_token>)
-                                     │
-                                     ├── provider "openai" / "generic-…"
-                                     │       └─▶ baseUrl/chat/completions
-                                     │           (Authorization: Bearer apiKey)
-                                     │
-                                     └── provider "anthropic"
-                                             └─▶ baseUrl/messages
-                                                 (x-api-key: apiKey, anthropic-version: …)
+Codex Desktop ── /v1/responses ──▶ VibeProxy (127.0.0.1:8317)
 ```
 
-The shim translates Codex's Responses-API request into the upstream's shape
-(chat completions or Anthropic Messages) and translates the streamed reply
-back. Extended-thinking blocks from Anthropic-shaped upstreams (Claude,
-DeepSeek, GLM) round-trip through `reasoning.encrypted_content` items.
+Because VibeProxy already speaks the OpenAI Responses API, there is no need
+for a middleman proxy. The shim only does one thing:
+
+1. **Catalog generation** — fetches `/v1/models` from VibeProxy and builds a
+   Codex-compatible `custom_model_catalog.json` with inferred context windows,
+   reasoning levels, and metadata.
+
+Codex then talks to VibeProxy directly.
 
 ---
 
@@ -251,38 +181,32 @@ to call `list_mcp_resources` to discover what's available.
 ## Commands
 
 ```
-codex-shim generate         regenerate catalog/config without starting daemon
-codex-shim start            start local shim daemon
-codex-shim status           health check + model count
-codex-shim stop             stop daemon
-codex-shim restart          restart daemon
-codex-shim list             list generated slugs and Factory routes
+codex-shim generate         regenerate catalog/config
+codex-shim list             list generated slugs and VibeProxy routes
+codex-shim enable           install shim config into ~/.codex/config.toml
+codex-shim disable          restore original ~/.codex/config.toml
 codex-shim model list       list slugs currently usable in the picker
 codex-shim model use <slug> set the Desktop default model
 codex-shim codex -- <args>  exec `codex` CLI through the shim
 codex-shim app [path]       launch Codex Desktop through the shim
-
-codex-app [path]            shortcut for `codex-shim app`
-codex-model [list|<slug>]   shortcut for `codex-shim model …`
 ```
 
-All commands accept `--settings <path>` and `--port <port>`.
+All commands accept `--vibeproxy-url <url>` and `--vibeproxy-api-url <url>`.
 
 ---
 
 ## File layout
 
 ```
-codex_shim/             python source (server + cli + translation)
-bin/codex-shim          main entrypoint
-bin/codex-app           shortcut wrapping `codex-shim app`
-bin/codex-model         shortcut wrapping `codex-shim model …`
-.codex-shim/            generated catalog, config, logs, pid (gitignored)
+codex_shim/             python source (catalog + cli + settings)
+bin/                    wrapper scripts (optional, for repo-local use)
+.codex-shim/            generated catalog, config, backups (gitignored)
 tests/                  pytest suite
 ```
 
-The shim never edits `~/.codex/config.toml`. All Codex overrides are passed
-inline as `-c key=value` arguments per launch.
+The shim never edits `~/.codex/config.toml` unless you run `codex-shim enable`
+or `codex-shim app`. All Codex overrides are passed inline as `-c key=value`
+arguments per launch.
 
 ---
 
@@ -290,4 +214,5 @@ inline as `-c key=value` arguments per launch.
 
 MIT — see `LICENSE`.
 
-Codex Desktop is a trademark of OpenAI. This project is unaffiliated.
+Codex Desktop is a trademark of OpenAI. VibeProxy is a trademark of Automaze,
+Ltd. This project is unaffiliated with either.

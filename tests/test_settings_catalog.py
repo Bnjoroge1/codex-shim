@@ -1,57 +1,76 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
 
 from codex_shim.catalog import catalog_entry
-from codex_shim.settings import FactorySettings
-
-
-def test_duplicate_models_get_unique_display_slugs(tmp_path):
-    settings = tmp_path / "settings.json"
-    settings.write_text(
-        json.dumps(
-            {
-                "customModels": [
-                    {"model": "gpt-5.5", "displayName": "Fast High", "provider": "openai", "baseUrl": "http://x/v1", "index": 1},
-                    {"model": "gpt-5.5", "displayName": "Fast Low", "provider": "openai", "baseUrl": "http://x/v1", "index": 2},
-                ]
-            }
-        )
-    )
-    models = FactorySettings(settings).load()
-    assert [m.slug for m in models] == ["fast-high", "fast-low"]
+from codex_shim.settings import VibeProxySettings
 
 
 def test_catalog_preserves_context_and_visibility():
-    model = FactorySettingsFixture.one()
+    model = VibeProxyModelFixture.one()
     entry = catalog_entry(model)
-    assert entry["slug"] == "claude-opus"
+    assert entry["slug"] == "gpt-5.5"
     assert entry["visibility"] == "list"
-    assert entry["context_window"] == 200000
+    assert entry["context_window"] == 400000
     assert "free" in entry["available_in_plans"]
 
 
-class FactorySettingsFixture:
+def test_kimi_gets_context():
+    model = VibeProxyModelFixture.kimi()
+    entry = catalog_entry(model)
+    assert entry["context_window"] == 256000
+
+
+async def test_fetch_models_from_vibeproxy():
+    async def models(request):
+        return web.json_response(
+            {
+                "object": "list",
+                "data": [
+                    {"id": "gpt-5.5", "object": "model", "created": 1, "owned_by": "openai"},
+                    {"id": "kimi-k2", "object": "model", "created": 2, "owned_by": "moonshot"},
+                ],
+            }
+        )
+
+    app = web.Application()
+    app.router.add_get("/v1/models", models)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+
+    settings = VibeProxySettings(str(client.make_url("")))
+    models_list = await settings.aload()
+    assert [m.model for m in models_list] == ["gpt-5.5", "kimi-k2"]
+    assert models_list[0].slug == "gpt-5.5"
+
+    await client.close()
+
+
+class VibeProxyModelFixture:
     @staticmethod
     def one():
-        import tempfile
-        from pathlib import Path
+        from codex_shim.settings import VibeProxyModel
 
-        path = Path(tempfile.mkdtemp()) / "settings.json"
-        path.write_text(
-            json.dumps(
-                {
-                    "customModels": [
-                        {
-                            "model": "claude-opus",
-                            "displayName": "Claude Opus",
-                            "provider": "anthropic",
-                            "baseUrl": "http://anthropic",
-                            "maxContextLimit": 200000,
-                        }
-                    ]
-                }
-            )
+        return VibeProxyModel(
+            slug="gpt-5.5",
+            model="gpt-5.5",
+            display_name="GPT-5.5",
+            owned_by="openai",
+            index=0,
         )
-        return FactorySettings(path).load()[0]
 
+    @staticmethod
+    def kimi():
+        from codex_shim.settings import VibeProxyModel
+
+        return VibeProxyModel(
+            slug="kimi-k2",
+            model="kimi-k2",
+            display_name="Kimi K2 (moonshot)",
+            owned_by="moonshot",
+            index=1,
+        )

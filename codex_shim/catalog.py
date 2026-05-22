@@ -3,21 +3,21 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from .settings import FactoryModel, PROVIDER_NAME, default_model_slug
+from .settings import PROVIDER_NAME, VibeProxyModel, default_model_slug
 
 
 PLAN_TIERS = ["free", "plus", "pro", "team", "business", "enterprise"]
 
 
-def catalog_entry(model: FactoryModel) -> dict:
-    context = model.max_context_limit or _default_context(model)
+def catalog_entry(model: VibeProxyModel) -> dict:
+    context = _default_context(model)
     compact = max(8_000, int(context * 0.8))
     truncation = min(64_000, max(8_000, int(context * 0.32)))
     reasoning = _reasoning_effort(model)
     return {
         "slug": model.slug,
         "display_name": model.display_name,
-        "description": f"{model.display_name} via local Factory BYOK shim.",
+        "description": f"{model.display_name} via VibeProxy.",
         "context_window": context,
         "max_context_window": context,
         "auto_compact_token_limit": compact,
@@ -39,8 +39,8 @@ def catalog_entry(model: FactoryModel) -> dict:
         "supports_search_tool": False,
         "supports_parallel_tool_calls": True,
         "experimental_supported_tools": [],
-        "input_modalities": ["text"] if model.no_image_support else ["text", "image"],
-        "supports_image_detail_original": not model.no_image_support,
+        "input_modalities": ["text", "image"],
+        "supports_image_detail_original": True,
         "shell_type": "shell_command",
         "visibility": "list",
         "minimal_client_version": "0.0.1",
@@ -50,10 +50,10 @@ def catalog_entry(model: FactoryModel) -> dict:
         "priority": max(1, 1000 - model.index),
         "prefer_websockets": False,
         "available_in_plans": PLAN_TIERS,
-        "base_instructions": "You are a coding agent running in Codex through a local BYOK shim.",
+        "base_instructions": "You are a coding agent running in Codex through VibeProxy.",
         "model_messages": {
             "instructions_template": (
-                "You are Codex running on {model_name} through a local Factory BYOK shim. "
+                "You are Codex running on {model_name} through VibeProxy. "
                 "Be a helpful, direct coding collaborator."
             ),
             "instructions_variables": {"model_name": model.display_name},
@@ -61,64 +61,15 @@ def catalog_entry(model: FactoryModel) -> dict:
     }
 
 
-def chatgpt_passthrough_entry() -> dict:
-    """Catalog entry for the original GPT-5.5 routed through ChatGPT passthrough."""
-    return {
-        "slug": "gpt-5.5",
-        "display_name": "GPT-5.5",
-        "description": "OpenAI GPT-5.5 — the default Codex model, routed through ChatGPT passthrough.",
-        "context_window": 400000,
-        "max_context_window": 400000,
-        "auto_compact_token_limit": 320000,
-        "truncation_policy": {"mode": "tokens", "limit": 64000},
-        "default_reasoning_level": "medium",
-        "supported_reasoning_levels": [
-            {"effort": "minimal", "description": "Minimal reasoning"},
-            {"effort": "low", "description": "Faster, lighter reasoning"},
-            {"effort": "medium", "description": "Balanced"},
-            {"effort": "high", "description": "Deeper reasoning"},
-            {"effort": "xhigh", "description": "Maximum reasoning"},
-        ],
-        "default_reasoning_summary": "auto",
-        "reasoning_summary_format": "experimental",
-        "supports_reasoning_summaries": True,
-        "default_verbosity": "medium",
-        "support_verbosity": True,
-        "apply_patch_tool_type": "freeform",
-        "web_search_tool_type": "text_and_image",
-        "supports_search_tool": True,
-        "supports_parallel_tool_calls": True,
-        "experimental_supported_tools": [],
-        "input_modalities": ["text", "image"],
-        "supports_image_detail_original": True,
-        "shell_type": "shell_command",
-        "visibility": "list",
-        "minimal_client_version": "0.0.1",
-        "supported_in_api": True,
-        "availability_nux": None,
-        "upgrade": None,
-        "isDefault": True,
-        "priority": 10000,
-        "prefer_websockets": False,
-        "available_in_plans": PLAN_TIERS,
-        "base_instructions": "You are Codex, a coding agent powered by GPT-5.5.",
-        "model_messages": {
-            "instructions_template": "You are Codex, a coding agent powered by GPT-5.5.",
-            "instructions_variables": {"model_name": "GPT-5.5"},
-        },
-    }
-
-
-def write_catalog(models: list[FactoryModel], path: Path) -> Path:
+def write_catalog(models: list[VibeProxyModel], path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    entries = [chatgpt_passthrough_entry()]
-    entries.extend(catalog_entry(model) for model in models)
+    entries = [catalog_entry(model) for model in models]
     payload = {"models": entries}
     path.write_text(json.dumps(payload, indent=2, sort_keys=False) + "\n")
     return path
 
 
-def write_config(models: list[FactoryModel], path: Path, catalog_path: Path, port: int) -> Path:
+def write_config(models: list[VibeProxyModel], path: Path, catalog_path: Path, base_url: str) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     default_slug = default_model_slug(models)
     text = f'''# Generated by codex-shim. This file is opt-in and is not ~/.codex/config.toml.
@@ -127,8 +78,8 @@ model_provider = "{PROVIDER_NAME}"
 model_catalog_json = "{_toml_escape(str(catalog_path))}"
 
 [model_providers.{PROVIDER_NAME}]
-name = "Factory BYOK Shim"
-base_url = "http://127.0.0.1:{port}/v1"
+name = "VibeProxy"
+base_url = "{_toml_escape(base_url)}"
 wire_api = "responses"
 experimental_bearer_token = "dummy"
 request_max_retries = 3
@@ -139,13 +90,13 @@ stream_idle_timeout_ms = 600000
     return path
 
 
-def codex_config_overrides(catalog_path: Path, default_slug: str, port: int) -> list[str]:
+def codex_config_overrides(catalog_path: Path, default_slug: str, base_url: str) -> list[str]:
     return [
         f'model="{_toml_escape(default_slug)}"',
         f'model_provider="{PROVIDER_NAME}"',
         f'model_catalog_json="{_toml_escape(str(catalog_path))}"',
-        f'model_providers.{PROVIDER_NAME}.name="Factory BYOK Shim"',
-        f'model_providers.{PROVIDER_NAME}.base_url="http://127.0.0.1:{port}/v1"',
+        f'model_providers.{PROVIDER_NAME}.name="VibeProxy"',
+        f'model_providers.{PROVIDER_NAME}.base_url="{_toml_escape(base_url)}"',
         f'model_providers.{PROVIDER_NAME}.wire_api="responses"',
         f'model_providers.{PROVIDER_NAME}.experimental_bearer_token="dummy"',
         f'model_providers.{PROVIDER_NAME}.request_max_retries=3',
@@ -154,18 +105,22 @@ def codex_config_overrides(catalog_path: Path, default_slug: str, port: int) -> 
     ]
 
 
-def _default_context(model: FactoryModel) -> int:
+def _default_context(model: VibeProxyModel) -> int:
     lower = f"{model.model} {model.display_name}".lower()
     if "claude" in lower:
         return 200_000
-    if "gpt-5" in lower:
+    if "gpt-5" in lower or "codex" in lower:
         return 400_000
     if "gemini" in lower:
         return 1_000_000
+    if "kimi" in lower:
+        return 256_000
+    if "deepseek" in lower:
+        return 128_000
     return 128_000
 
 
-def _reasoning_effort(model: FactoryModel) -> str:
+def _reasoning_effort(model: VibeProxyModel) -> str:
     lower = model.display_name.lower()
     if "xhigh" in lower or "x-high" in lower:
         return "xhigh"
@@ -180,4 +135,3 @@ def _reasoning_effort(model: FactoryModel) -> str:
 
 def _toml_escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
-

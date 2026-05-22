@@ -3,23 +3,17 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
-import signal
 import subprocess
 import sys
-import time
-import hashlib
-from urllib.request import urlopen
 
 from .catalog import codex_config_overrides, write_catalog, write_config
-from .settings import DEFAULT_FACTORY_SETTINGS, DEFAULT_HOST, DEFAULT_PORT, FactorySettings, default_model_slug
+from .settings import VIBEPROXY_URL, VIBEPROXY_API_URL, VibeProxySettings, default_model_slug
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RUNTIME_DIR = PROJECT_ROOT / ".codex-shim"
 CATALOG_PATH = RUNTIME_DIR / "custom_model_catalog.json"
 CONFIG_PATH = RUNTIME_DIR / "config.toml"
-PID_PATH = RUNTIME_DIR / "shim.pid"
-LOG_PATH = RUNTIME_DIR / "shim.log"
 CODEX_CONFIG_PATH = Path.home() / ".codex" / "config.toml"
 CODEX_CONFIG_BACKUP_PATH = RUNTIME_DIR / "config.toml.before-codex-shim"
 MANAGED_BEGIN = "# >>> codex-shim managed >>>"
@@ -28,17 +22,15 @@ MANAGED_END = "# <<< codex-shim managed <<<"
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="codex-shim")
-    parser.add_argument("--settings", type=Path, default=DEFAULT_FACTORY_SETTINGS)
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--vibeproxy-url", default=VIBEPROXY_URL,
+                        help="URL for fetching the model list (default: http://127.0.0.1:8318)")
+    parser.add_argument("--vibeproxy-api-url", default=VIBEPROXY_API_URL,
+                        help="URL for the Responses/Chat API (default: http://127.0.0.1:8317)")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("generate")
     sub.add_parser("list")
-    sub.add_parser("start")
     sub.add_parser("enable")
-    sub.add_parser("stop")
     sub.add_parser("disable")
-    sub.add_parser("restart")
-    sub.add_parser("status")
     sub.add_parser("patch-app", help="Patch Codex Desktop model dropdown to allow custom catalog models.")
     sub.add_parser("restore-app", help="Restore Codex Desktop app.asar from the pre-patch backup.")
 
@@ -56,66 +48,56 @@ def main(argv: list[str] | None = None) -> int:
     app_parser.add_argument("path", nargs="?", default=".")
 
     args = parser.parse_args(argv)
+    base_url = _effective_base_url(args.vibeproxy_api_url)
+
     if args.command == "generate":
-        generate(args.settings, args.port)
+        generate(args.vibeproxy_url, base_url)
         return 0
     if args.command == "list":
-        return list_models(args.settings)
-    if args.command in {"start", "enable"}:
-        generate(args.settings, args.port)
-        code = start(args.settings, args.port)
-        if code == 0 and args.command == "enable":
-            install_codex_config(args.settings, args.port)
-        return code
-    if args.command in {"stop", "disable"}:
-        if args.command == "disable":
-            restore_codex_config()
-        return stop()
-    if args.command == "restart":
-        stop()
-        generate(args.settings, args.port)
-        return start(args.settings, args.port)
-    if args.command == "status":
-        return status(args.port)
+        return list_models(args.vibeproxy_url)
+    if args.command == "enable":
+        generate(args.vibeproxy_url, base_url)
+        install_codex_config(args.vibeproxy_url, base_url)
+        return 0
+    if args.command == "disable":
+        restore_codex_config()
+        return 0
     if args.command == "patch-app":
         return patch_codex_app()
     if args.command == "restore-app":
         return restore_codex_app_bundle()
     if args.command == "model":
         if args.model_command == "list":
-            return list_models(args.settings)
+            return list_models(args.vibeproxy_url)
         if args.model_command == "use":
-            generate(args.settings, args.port)
-            ensure_started(args.settings, args.port)
-            install_codex_config(args.settings, args.port, args.model_slug)
+            generate(args.vibeproxy_url, base_url)
+            install_codex_config(args.vibeproxy_url, base_url, args.model_slug)
             print(f"Active Codex shim model: {args.model_slug}")
             return 0
     if args.command == "codex":
-        generate(args.settings, args.port)
-        ensure_started(args.settings, args.port)
-        exec_codex(args.settings, args.port, args.args)
+        generate(args.vibeproxy_url, base_url)
+        exec_codex(args.vibeproxy_url, base_url, args.args)
         return 0
     if args.command == "app":
-        generate(args.settings, args.port)
-        ensure_started(args.settings, args.port)
-        install_codex_config(args.settings, args.port, args.model_slug)
-        exec_codex_app(args.settings, args.port, args.path)
+        generate(args.vibeproxy_url, base_url)
+        install_codex_config(args.vibeproxy_url, base_url, args.model_slug)
+        exec_codex_app(args.path)
         return 0
     return 2
 
 
-def generate(settings_path: Path, port: int) -> None:
-    models = FactorySettings(settings_path).load()
+def generate(vibeproxy_url: str, base_url: str) -> None:
+    models = VibeProxySettings(vibeproxy_url).load()
     write_catalog(models, CATALOG_PATH)
-    write_config(models, CONFIG_PATH, CATALOG_PATH, port)
+    write_config(models, CONFIG_PATH, CATALOG_PATH, base_url)
     print(f"Generated {len(models)} model entries:")
     print(f"  catalog: {CATALOG_PATH}")
     print(f"  config:  {CONFIG_PATH}")
     print("No files under ~/.codex were modified.")
 
 
-def install_codex_config(settings_path: Path, port: int, model_slug: str | None = None) -> None:
-    models = FactorySettings(settings_path).load()
+def install_codex_config(vibeproxy_url: str, base_url: str, model_slug: str | None = None) -> None:
+    models = VibeProxySettings(vibeproxy_url).load()
     default_slug = _resolve_model_slug(models, model_slug)
     CODEX_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
@@ -124,70 +106,19 @@ def install_codex_config(settings_path: Path, port: int, model_slug: str | None 
         CODEX_CONFIG_BACKUP_PATH.write_text(original)
     cleaned = _remove_managed_config(original)
     cleaned = _remove_top_level_keys(cleaned, {"model", "model_provider", "model_catalog_json"})
-    cleaned = _remove_section(cleaned, "model_providers.factory_byok_shim")
-    top_block, provider_block = _managed_config_blocks(default_slug, port)
+    cleaned = _remove_section(cleaned, "model_providers.vibeproxy_shim")
+    top_block, provider_block = _managed_config_blocks(default_slug, base_url)
     CODEX_CONFIG_PATH.write_text(top_block + "\n" + cleaned.lstrip() + "\n" + provider_block)
     print(f"Installed shim config into {CODEX_CONFIG_PATH}.")
     print(f"Original backup: {CODEX_CONFIG_BACKUP_PATH}")
 
 
-def list_models(settings_path: Path) -> int:
-    models = FactorySettings(settings_path).load()
+def list_models(vibeproxy_url: str) -> int:
+    models = VibeProxySettings(vibeproxy_url).load()
     width = max([len(m.slug) for m in models] + [4])
     for model in models:
-        print(f"{model.slug:<{width}}  {model.display_name}  ->  {model.model} ({model.provider})")
+        print(f"{model.slug:<{width}}  {model.display_name}  ->  {model.model} ({model.owned_by})")
     return 0
-
-
-def start(settings_path: Path, port: int) -> int:
-    if _pid_running(_read_pid()):
-        print(f"Shim already running with pid {_read_pid()}.")
-        return 0
-    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-    log = LOG_PATH.open("ab")
-    cmd = [
-        sys.executable,
-        "-m",
-        "codex_shim.server",
-        "--settings",
-        str(settings_path),
-        "--host",
-        DEFAULT_HOST,
-        "--port",
-        str(port),
-    ]
-    env = os.environ.copy()
-    env["PYTHONPATH"] = str(PROJECT_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
-    process = subprocess.Popen(cmd, cwd=str(PROJECT_ROOT), env=env, stdout=log, stderr=log, start_new_session=True)
-    PID_PATH.write_text(str(process.pid))
-    for _ in range(50):
-        if _healthy(port):
-            print(f"Shim started on http://{DEFAULT_HOST}:{port} with pid {process.pid}.")
-            print(f"Log: {LOG_PATH}")
-            return 0
-        if process.poll() is not None:
-            print(f"Shim exited during startup. See {LOG_PATH}.", file=sys.stderr)
-            return 1
-        time.sleep(0.1)
-    print(f"Shim process started but health check timed out. See {LOG_PATH}.", file=sys.stderr)
-    return 1
-
-
-def stop() -> int:
-    pid = _read_pid()
-    if not _pid_running(pid):
-        print("Shim is not running.")
-        PID_PATH.unlink(missing_ok=True)
-        return 0
-    os.kill(pid, signal.SIGTERM)
-    for _ in range(50):
-        if not _pid_running(pid):
-            PID_PATH.unlink(missing_ok=True)
-            print("Shim stopped.")
-            return 0
-        time.sleep(0.1)
-    print(f"Shim pid {pid} did not exit after SIGTERM.", file=sys.stderr)
-    return 1
 
 
 def restore_codex_config() -> None:
@@ -199,32 +130,13 @@ def restore_codex_config() -> None:
     if CODEX_CONFIG_PATH.exists():
         current = CODEX_CONFIG_PATH.read_text()
         restored = _remove_managed_config(current)
-        restored = _remove_section(restored, "model_providers.factory_byok_shim")
+        restored = _remove_section(restored, "model_providers.vibeproxy_shim")
         CODEX_CONFIG_PATH.write_text(restored.lstrip())
         print(f"Removed shim config from {CODEX_CONFIG_PATH}.")
 
 
-def status(port: int) -> int:
-    pid = _read_pid()
-    if _pid_running(pid) and _healthy(port):
-        print(f"Shim is running on http://{DEFAULT_HOST}:{port} with pid {pid}.")
-        return 0
-    if _pid_running(pid):
-        print(f"Shim process {pid} exists but health check failed.")
-        return 1
-    print("Shim is stopped.")
-    return 1
-
-
-def ensure_started(settings_path: Path, port: int) -> None:
-    if not (_pid_running(_read_pid()) and _healthy(port)):
-        code = start(settings_path, port)
-        if code:
-            raise SystemExit(code)
-
-
-def exec_codex(settings_path: Path, port: int, codex_args: list[str]) -> None:
-    overrides = _override_args(settings_path, port)
+def exec_codex(vibeproxy_url: str, base_url: str, codex_args: list[str]) -> None:
+    overrides = _override_args(vibeproxy_url, base_url)
     codex_args = list(codex_args or [])
     if codex_args[:1] == ["--"]:
         codex_args = codex_args[1:]
@@ -232,7 +144,7 @@ def exec_codex(settings_path: Path, port: int, codex_args: list[str]) -> None:
     os.execvp("codex", args)
 
 
-def exec_codex_app(settings_path: Path, port: int, path: str) -> None:
+def exec_codex_app(path: str) -> None:
     _quit_codex_app()
     args = ["codex", "app", path]
     subprocess.Popen(args)
@@ -243,6 +155,7 @@ def _quit_codex_app() -> None:
     script = 'tell application "Codex" to if it is running then quit'
     try:
         subprocess.run(["osascript", "-e", script], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        import time
         time.sleep(1.0)
     except OSError:
         pass
@@ -274,7 +187,6 @@ def patch_codex_app() -> int:
     _quit_codex_app()
     if workdir.exists():
         import shutil
-
         shutil.rmtree(workdir)
     workdir.mkdir(parents=True)
 
@@ -314,11 +226,11 @@ def restore_codex_app_bundle() -> int:
 
 def _has_command(command: str) -> bool:
     from shutil import which
-
     return which(command) is not None
 
 
 def _app_asar_hash(path: Path) -> str:
+    import hashlib
     h = hashlib.sha256()
     with path.open("rb") as f:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
@@ -343,9 +255,6 @@ def _find_model_queries_bundle(workdir: Path, needle: str, replacement: str) -> 
 
 
 def _resign_codex_app() -> None:
-    # Electron validates app.asar through the bundle signature metadata at
-    # startup. Re-sign after patching so the modified archive does not trip the
-    # asar integrity check.
     subprocess.run(
         ["codesign", "--force", "--deep", "--sign", "-", "/Applications/Codex.app"],
         check=True,
@@ -354,6 +263,7 @@ def _resign_codex_app() -> None:
 
 
 def _foreground_codex_app() -> None:
+    import time
     script = '''
 tell application "Codex" to activate
 delay 0.5
@@ -379,18 +289,18 @@ end tell
         pass
 
 
-def _managed_config_blocks(default_slug: str, port: int) -> tuple[str, str]:
+def _managed_config_blocks(default_slug: str, base_url: str) -> tuple[str, str]:
     top_block = f'''{MANAGED_BEGIN}
 model = "{default_slug}"
-model_provider = "factory_byok_shim"
+model_provider = "vibeproxy_shim"
 model_catalog_json = "{CATALOG_PATH}"
 {MANAGED_END}
 '''
 
     provider_block = f'''{MANAGED_BEGIN}
-[model_providers.factory_byok_shim]
-name = "Factory BYOK Shim"
-base_url = "http://127.0.0.1:{port}/v1"
+[model_providers.vibeproxy_shim]
+name = "VibeProxy"
+base_url = "{base_url}"
 wire_api = "responses"
 experimental_bearer_token = "dummy"
 request_max_retries = 3
@@ -442,10 +352,10 @@ def _remove_section(text: str, section: str) -> str:
     return "\n".join(output) + ("\n" if text.endswith("\n") else "")
 
 
-def _override_args(settings_path: Path, port: int) -> list[str]:
-    models = FactorySettings(settings_path).load()
+def _override_args(vibeproxy_url: str, base_url: str) -> list[str]:
+    models = VibeProxySettings(vibeproxy_url).load()
     default_slug = default_model_slug(models)
-    pairs = codex_config_overrides(CATALOG_PATH, default_slug, port)
+    pairs = codex_config_overrides(CATALOG_PATH, default_slug, base_url)
     args: list[str] = []
     for pair in pairs:
         args.extend(["-c", pair])
@@ -481,29 +391,11 @@ def _current_managed_model() -> str | None:
     return None
 
 
-def _healthy(port: int) -> bool:
-    try:
-        with urlopen(f"http://{DEFAULT_HOST}:{port}/health", timeout=0.5) as response:
-            return response.status == 200
-    except Exception:
-        return False
-
-
-def _read_pid() -> int | None:
-    try:
-        return int(PID_PATH.read_text().strip())
-    except Exception:
-        return None
-
-
-def _pid_running(pid: int | None) -> bool:
-    if not pid:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
+def _effective_base_url(vibeproxy_url: str) -> str:
+    base = vibeproxy_url.rstrip("/")
+    if not base.endswith("/v1"):
+        base = base + "/v1"
+    return base
 
 
 if __name__ == "__main__":
