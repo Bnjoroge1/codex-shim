@@ -262,39 +262,27 @@ def _patch_codex_shim_menu(workdir: Path) -> bool:
     if not build_dir.exists():
         return False
     target = "oe=ue.refreshApplicationMenu;let de=()=>{ue.refreshApplicationMenu()};"
-    replacement = f"{_codex_shim_menu_js()};oe=()=>{{ue.refreshApplicationMenu(),__codexShimMenu()}};let de=()=>{{oe()}};"
     startup_target = "ue.refreshApplicationMenu(),w(`application menu refreshed`,A)"
     startup_replacement = "oe(),w(`application menu refreshed`,A)"
     direct_refresh = "=>{ue.refreshApplicationMenu()}"
     wrapped_refresh = "=>{oe()}"
     for path in sorted(build_dir.glob("main-*.js")):
         text = path.read_text()
-        if "codex-shim-menu-enable" in text:
-            if direct_refresh in text:
-                path.write_text(text.replace(direct_refresh, wrapped_refresh))
-                print("Patched Codex Desktop VibeProxy menu refresh hooks.")
-                return True
-            return False
-        if "codex-shim-toggle-enable" in text:
-            pattern = r"let __codexShimMenu=\(\)=>\{try\{.*?\}\};oe=\(\)=>\{ue\.refreshApplicationMenu\(\),__codexShimMenu\(\)\};"
-            text, count = re.subn(pattern, f"{_codex_shim_menu_js()};oe=()=>{{ue.refreshApplicationMenu(),__codexShimMenu()}};", text, count=1)
-            if count:
-                text = text.replace(direct_refresh, wrapped_refresh)
+        if "codex-shim-menu-enable" in text or "codex-shim-toggle-enable" in text:
+            start = text.find("let __codexShimMenu=")
+            end = text.find("se.setOnBrowserSidebarStateChanged", start)
+            if start >= 0 and end > start:
+                text = (
+                    text[:start]
+                    + target
+                    + text[end:]
+                ).replace(startup_replacement, startup_target, 1).replace(wrapped_refresh, direct_refresh)
                 path.write_text(text)
-                print("Updated Codex Desktop VibeProxy menu placement.")
+                print("Removed legacy Codex Desktop VibeProxy menu hook.")
                 return True
             return False
         if target not in text:
             continue
-        text = (
-            text.replace(target, replacement, 1)
-            .replace(startup_target, startup_replacement, 1)
-            .replace(direct_refresh, wrapped_refresh)
-        )
-        path.write_text(text)
-        print("Patched Codex Desktop VibeProxy menu.")
-        return True
-    print("Could not find the expected application menu hook in Codex Desktop.", file=sys.stderr)
     return False
 
 
@@ -313,10 +301,6 @@ def _patch_codex_shim_bootstrap_menu(workdir: Path) -> bool:
     bootstrap.write_text(text.replace(target, hook, 1))
     print("Patched Codex Desktop bootstrap VibeProxy menu hook.")
     return True
-
-
-def _codex_shim_menu_js() -> str:
-    return """let __codexShimMenu=()=>{try{let e=n.Menu.getApplicationMenu();if(!e||e.getMenuItemById(`codex-shim-menu-enable`))return;let t=`${process.env.HOME}/.local/bin/codex-shim`,r=(e,r,i=!0)=>{d.execFile(t,[e],(e,t,a)=>{let o=e?`VibeProxy ${r} failed`:`VibeProxy ${r}`,s=(t||a||e?.message||``).trim(),c=i&&!e?[`Restart Codex`,`Later`]:[`OK`];n.dialog.showMessageBox({type:e?`error`:`info`,buttons:c,defaultId:0,cancelId:c.length-1,message:o,detail:`${s}${s?`\\n\\n`:``}Restart Codex Desktop for model picker changes to apply.`}).then(t=>{i&&!e&&t.response===0&&(n.app.relaunch(),n.app.exit(0))})})};let i=n.Menu.buildFromTemplate([{type:`separator`},{id:`codex-shim-menu-enable`,label:`Enable VibeProxy`,click:()=>r(`enable`,`enabled`)},{id:`codex-shim-menu-disable`,label:`Disable VibeProxy`,click:()=>r(`disable`,`disabled`)},{id:`codex-shim-menu-status`,label:`Show VibeProxy Status`,click:()=>r(`status`,`status`,!1)}]),a=e.items[0]?.submenu;if(!a)return;for(let e of i.items)a.append(e);n.Menu.setApplicationMenu(e)}catch(e){}}"""
 
 
 def _codex_shim_bootstrap_menu_js() -> str:
