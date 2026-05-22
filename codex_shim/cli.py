@@ -4,6 +4,7 @@ import argparse
 import os
 from pathlib import Path
 import subprocess
+import struct
 import sys
 
 from .catalog import codex_config_overrides, write_catalog, write_config
@@ -88,9 +89,8 @@ def main(argv: list[str] | None = None) -> int:
         generate(args.vibeproxy_url, base_url)
         models = VibeProxySettings(args.vibeproxy_url).load()
         default_slug = _resolve_model_slug(models, args.model_slug)
-        config = CodexConfig(CODEX_CONFIG_PATH, CODEX_CONFIG_BACKUP_PATH)
-        config.install_shim(default_slug, base_url, CATALOG_PATH, provider_name=default_slug)
-        exec_codex_app(args.path)
+        overrides = _override_args(args.vibeproxy_url, base_url, default_slug=default_slug)
+        exec_codex_app(args.path, overrides)
         return 0
     return 2
 
@@ -123,9 +123,9 @@ def exec_codex(vibeproxy_url: str, base_url: str, codex_args: list[str]) -> None
     os.execvp("codex", args)
 
 
-def exec_codex_app(path: str) -> None:
+def exec_codex_app(path: str, overrides: list[str]) -> None:
     _quit_codex_app()
-    args = ["codex", "app", path]
+    args = ["codex", "app", *overrides, path]
     subprocess.Popen(args)
     _foreground_codex_app()
 
@@ -187,6 +187,7 @@ def patch_codex_app() -> int:
         print("Could not find the expected model picker filter in Codex Desktop.", file=sys.stderr)
         return 1
     if changed:
+        _update_asar_integrity(app_asar)
         _resign_codex_app()
     return 0
 
@@ -199,6 +200,8 @@ def restore_codex_app_bundle() -> int:
         return 0
     _quit_codex_app()
     app_asar.write_bytes(backup.read_bytes())
+    _update_asar_integrity(app_asar)
+    _resign_codex_app()
     print(f"Restored {app_asar} from {backup}.")
     return 0
 
@@ -241,6 +244,32 @@ def _resign_codex_app() -> None:
     print("Re-signed Codex.app after patch.")
 
 
+def _update_asar_integrity(app_asar: Path) -> None:
+    info_plist = Path("/Applications/Codex.app/Contents/Info.plist")
+    if not info_plist.exists():
+        return
+    header_hash = _asar_header_hash(app_asar)
+    subprocess.run(
+        [
+            "/usr/libexec/PlistBuddy",
+            "-c",
+            f"Set :ElectronAsarIntegrity:Resources/app.asar:hash {header_hash}",
+            str(info_plist),
+        ],
+        check=True,
+    )
+    print("Updated Electron ASAR integrity hash.")
+
+
+def _asar_header_hash(path: Path) -> str:
+    import hashlib
+
+    with path.open("rb") as f:
+        _, _, _, json_size = struct.unpack("<4I", f.read(16))
+        header_json = f.read(json_size)
+    return hashlib.sha256(header_json).hexdigest()
+
+
 def _foreground_codex_app() -> None:
     import time
     script = '''
@@ -268,10 +297,10 @@ end tell
         pass
 
 
-def _override_args(vibeproxy_url: str, base_url: str) -> list[str]:
+def _override_args(vibeproxy_url: str, base_url: str, default_slug: str | None = None) -> list[str]:
     models = VibeProxySettings(vibeproxy_url).load()
-    default_slug = default_model_slug(models)
-    pairs = codex_config_overrides(CATALOG_PATH, default_slug, base_url, provider_name=default_slug)
+    resolved_slug = default_slug or default_model_slug(models)
+    pairs = codex_config_overrides(CATALOG_PATH, resolved_slug, base_url, provider_name=resolved_slug)
     args: list[str] = []
     for pair in pairs:
         args.extend(["-c", pair])

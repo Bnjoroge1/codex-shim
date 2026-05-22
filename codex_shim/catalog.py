@@ -79,7 +79,7 @@ model_provider = "{PROVIDER_NAME}"
 model_catalog_json = "{_toml_escape(str(catalog_path))}"
 
 [model_providers.{PROVIDER_NAME}]
-name = "{_toml_escape(name)}""
+name = "{_toml_escape(name)}"
 base_url = "{_toml_escape(base_url)}"
 wire_api = "responses"
 experimental_bearer_token = "dummy"

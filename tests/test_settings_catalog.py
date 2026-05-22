@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import tomllib
 
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
-from codex_shim.catalog import catalog_entry
+from codex_shim.catalog import catalog_entry, write_config
 from codex_shim.settings import VibeProxySettings
 
 
@@ -23,6 +24,23 @@ def test_kimi_gets_context():
     model = VibeProxyModelFixture.kimi()
     entry = catalog_entry(model)
     assert entry["context_window"] == 256000
+
+
+def test_write_config_outputs_valid_toml(tmp_path: Path):
+    config_path = tmp_path / "config.toml"
+    catalog_path = tmp_path / "catalog.json"
+
+    write_config(
+        [VibeProxyModelFixture.one()],
+        config_path,
+        catalog_path,
+        "http://localhost:8317/v1",
+        provider_name="gpt-5.5",
+    )
+
+    data = tomllib.loads(config_path.read_text())
+    assert data["model"] == "gpt-5.5"
+    assert data["model_providers"]["vibeproxy_shim"]["name"] == "gpt-5.5"
 
 
 async def test_fetch_models_from_vibeproxy():
